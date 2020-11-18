@@ -33,6 +33,7 @@ var (
 
 	// Command line flags
 	period                time.Duration
+	releaseDelay          time.Duration
 	dsNamespace           string
 	dsName                string
 	lockAnnotation        string
@@ -45,6 +46,7 @@ var (
 	slackUsername         string
 	slackChannel          string
 	podSelectors          []string
+	releasePodSelectors   []string
 	rebootDays            []string
 	rebootStart           string
 	rebootEnd             string
@@ -70,6 +72,8 @@ func main() {
 
 	rootCmd.PersistentFlags().DurationVar(&period, "period", time.Minute*60,
 		"reboot check period")
+	rootCmd.PersistentFlags().DurationVar(&releaseDelay, "release-delay", 0,
+		"delay between un-cordon and lock release, interval for release checks")
 	rootCmd.PersistentFlags().StringVar(&dsNamespace, "ds-namespace", "kube-system",
 		"namespace containing daemonset on which to place lock")
 	rootCmd.PersistentFlags().StringVar(&dsName, "ds-name", "kured",
@@ -95,7 +99,9 @@ func main() {
 		"slack channel for reboot notfications")
 
 	rootCmd.PersistentFlags().StringArrayVar(&podSelectors, "blocking-pod-selector", nil,
-		"label selector identifying pods whose presence should prevent reboots")
+	"label selector identifying pods whose presence should prevent reboots")
+	rootCmd.PersistentFlags().StringArrayVar(&releasePodSelectors, "release-pod-selector", nil,
+		"label selector identifying pods that need to be ready before releasing lock")
 
 	rootCmd.PersistentFlags().StringSliceVar(&rebootDays, "reboot-days", timewindow.EveryDay,
 		"schedule reboot on these days")
@@ -168,7 +174,7 @@ func rebootRequired() bool {
 	return false
 }
 
-func rebootBlocked(client *kubernetes.Clientset, nodeID string) bool {
+func prometheusAlertsActive(client *kubernetes.Clientset, nodeID string) bool {
 	if prometheusURL != "" {
 		alertNames, err := alerts.PrometheusActiveAlerts(prometheusURL, alertFilter)
 		if err != nil {
@@ -184,7 +190,10 @@ func rebootBlocked(client *kubernetes.Clientset, nodeID string) bool {
 			return true
 		}
 	}
+	return false
+}
 
+func rebootBlockingPodsExist(client *kubernetes.Clientset, nodeID string) bool {
 	fieldSelector := fmt.Sprintf("spec.nodeName=%s", nodeID)
 	for _, labelSelector := range podSelectors {
 		podList, err := client.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
@@ -206,6 +215,38 @@ func rebootBlocked(client *kubernetes.Clientset, nodeID string) bool {
 			}
 			log.Warnf("Reboot blocked: matching pods: %v", podNames)
 			return true
+		}
+	}
+
+	return false
+}
+
+func releaseBlockingPodsNotready(client *kubernetes.Clientset, nodeID string) bool {
+	fieldSelector := fmt.Sprintf("spec.nodeName=%s", nodeID)
+	for _, labelSelector := range releasePodSelectors {
+		podList, err := client.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
+			LabelSelector: labelSelector,
+			FieldSelector: fieldSelector,
+		})
+		if err != nil {
+			log.Warnf("Release blocked: pod query error: %v", err)
+			return true
+		}
+
+		if len(podList.Items) > 0 {
+			// if any pod is not ready, return true
+			podNames := make([]string, 0, len(podList.Items))
+			for _, pod := range podList.Items {
+				for _, cond := range pod.Status.Conditions {
+					if cond.Type == v1.PodReady && cond.Status != v1.ConditionTrue {
+						podNames = append(podNames, pod.Name)
+					}
+				}
+			}
+			if len(podNames) > 0 {
+				log.Warnf("Release blocked: pods not ready: %v", podNames)
+				return true
+			}
 		}
 	}
 
@@ -318,6 +359,26 @@ type nodeMeta struct {
 	Unschedulable bool `json:"unschedulable"`
 }
 
+type blockingFunc func(*kubernetes.Clientset, string) bool
+
+// checkBlockConditions returns true if any blockingFunc is true
+func checkBlockConditions(client *kubernetes.Clientset, nodeID string, conditions ...blockingFunc) bool {
+	for _, condition := range conditions {
+		if condition(client, nodeID) {
+			return true
+		}
+	}
+	return false
+}
+
+func rebootBlocked(client *kubernetes.Clientset, nodeID string) bool {
+	return checkBlockConditions(client, nodeID, prometheusAlertsActive, rebootBlockingPodsExist)
+}
+
+func releaseBlocked(client *kubernetes.Clientset, nodeID string) bool {
+	return checkBlockConditions(client, nodeID, releaseBlockingPodsNotready)
+}
+
 func rebootAsRequired(nodeID string, window *timewindow.TimeWindow, TTL time.Duration) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -340,13 +401,25 @@ func rebootAsRequired(nodeID string, window *timewindow.TimeWindow, TTL time.Dur
 			}
 			uncordon(client, node)
 		}
+
+		if releaseDelay > 0 {
+			releaseTicker := time.NewTicker(releaseDelay)
+			running := true
+			for running {
+				<-releaseTicker.C
+				if !releaseBlocked(client, nodeID) {
+					releaseTicker.Stop()
+					running = false
+				}
+			}
+		}
 		release(lock)
 	}
 
 	source := rand.NewSource(time.Now().UnixNano())
-	tick := delaytick.New(source, period)
-	for range tick {
-		if window.Contains(time.Now()) && rebootRequired() && !rebootBlocked(client, nodeID) {
+	rebootTick := delaytick.New(source, period)
+	for _ = range rebootTick {
+		if rebootRequired() && !rebootBlocked(client, nodeID) {
 			node, err := client.CoreV1().Nodes().Get(context.TODO(), nodeID, metav1.GetOptions{})
 			if err != nil {
 				log.Fatal(err)
@@ -389,7 +462,8 @@ func root(cmd *cobra.Command, args []string) {
 	}
 	log.Infof("Reboot Sentinel: %s every %v", rebootSentinel, period)
 	log.Infof("Blocking Pod Selectors: %v", podSelectors)
-	log.Infof("Reboot on: %v", window)
+	log.Infof("Release Delay: %s", releaseDelay)
+	log.Infof("Release Blocking Pod selectors: %s", releasePodSelectors)
 
 	go rebootAsRequired(nodeID, window, lockTTL)
 	go maintainRebootRequiredMetric(nodeID)
